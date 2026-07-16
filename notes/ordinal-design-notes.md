@@ -18,7 +18,7 @@ response toward higher categories.
 | # | Decision | Rationale | Where |
 |---|----------|-----------|-------|
 | 1 | Thresholds stored in `psi` (extra-family-parameter vector) | Bolker's stated preference (option 3 of his Oct 2024 comment on #514); reuses existing R<->C++ transport, priors machinery (`psi_vprior`), `map`/`start` support | `glmmTMB.cpp` PARAMETER_VECTOR(psi); `R/glmmTMB.R` psi_init block |
-| 2 | Monotone parameterization `psi = c(theta[1], log(diff(theta)))` | Guarantees ordered thresholds with unconstrained optimization; same trick as `MASS::polr`. NOTE: `ordinal` pkg deliberately uses raw thresholds + Inf-on-violation for a more quadratic surface; we saw no convergence issues, but this is the most likely review discussion point. Swap = ~10 lines in C++ + start values. | `glmmTMB.cpp` theta_ord construction (search "theta_ord") |
+| 2 | Softmax threshold parameterization (Koslik et al 2025, arXiv:2511.17071, suggested by Bolker on #514): psi = log-weights of K baseline category probabilities (last fixed at 0); `theta = qlogis(cumsum(softmax(c(psi,0))))` | Empirical comparison (notes/ordinal-compare-parameterizations.R, 400 random-start fits x 8 conditions): all of {raw+Inf, cumsum-exp, softmax} reach the optimum 100% of the time; softmax needs fewest iterations (24.5 vs 27.0 raw vs 36.1 cumsum-exp), decisively better than cumsum-exp when extreme categories are sparse. Bonus: psi=0 is the equiprobable start; psi interpretable as baseline log category-probability ratios. (Original implementation used cumsum-exp; switched 2026-07-16 after the experiment.) | `glmmTMB.cpp` theta_ord construction; `R/glmmTMB.R` psi_init; `R/methods.R` family_params |
 | 3 | K inferred as `psi.size() + 1` in C++ | Avoids adding a DATA_INTEGER — no TMB data-structure change, no `up2date()` burden for stored fits | `glmmTMB.cpp` n_ord_levels |
 | 4 | Fixed-effect intercept fixed to 0 via internal `map` entry | Redundant with thresholds (any intercept shift is absorbed). Mapping (vs dropping the X column) keeps model matrices, predict-on-newdata, and rank checks untouched. Cost: summary shows "(Intercept) 0 NA" row. Only applied when the user hasn't supplied their own beta map. | `R/glmmTMB.R` "intercept is redundant" block after `parameters <-` |
 | 5 | `mu` redefined as expected category index E[Y] = K - sum_j P(Y<=j) | Keeps every scalar-mean downstream path working (fitted, response residuals, mu_predict). Per-category probabilities handled separately (#6). | `glmmTMB.cpp` mu override before obs loop |
@@ -29,6 +29,9 @@ response toward higher categories.
 | 10 | Dunn-Smyth residuals computed R-side from thresholds + `predict(type="link")` | The generic `dunnsmyth_resids()` is (y, mu, phi)-based; the CLM CDF needs thresholds, cleanest as a special case in `residuals.glmmTMB`. Discrete PIT: u ~ U(F(y-1), F(y)). | `R/methods.R` residuals "dunn-smyth" ordinal branch |
 | 11 | No dispersion (`.noDispersionFamilies`), no zero-inflation (hard error) | sigma() returns 1; dispformula ignored like binomial/poisson. Scale effects (heteroscedastic latent SD) would later map onto `dispformula` — see DrJerryTAO's #514 comment: sd multiplier = exp(z*zeta) dividing (theta-eta). | `R/glmmTMB.R` .noDispersionFamilies; zi check in glmmTMB() |
 | 12 | Family name `ordinal()` | Plan default; `cumulative()` (brms/VGAM naming) is the obvious alternative and leaves room for acat/cratio families later. Cheap to rename pre-merge; expensive after. | `R/family.R` |
+| 13 | `pad_mapped_vcov()` helper: treats map-fixed coefficients as known constants (zero variance) — pads reduced vcov to full size, or zeroes NA rows in full-size vcov | Fixes emmeans (dimension mismatch) and car::Anova (0*NA=NA made chisq blank) for the mapped ordinal intercept AND for any user-beta-mapped glmmTMB model (previously broken the same way). Verified: EMM contrasts == fixed-effect coefs; Anova chisq == z^2. | `R/methods.R` pad_mapped_vcov; used in `R/emmeans.R` emm_basis, `R/Anova.R` Anova.glmmTMB |
+| 14 | Summary suppresses the internally-mapped "(Intercept) 0 NA" row (only when the map was internal, not user-supplied) | Bolker's cosmetic request; ~10 contained lines | `R/glmmTMB.R` summary.glmmTMB after coef loop |
+| 15 | Map hygiene verified: `modelInfo$map` stores only the USER map (NULL for plain ordinal fits); internal map lives in `obj$env$map`; user psi maps compose with the internal beta map | Addresses Bolker's internal-map worry with evidence | test in test-ordinal.R |
 
 ## File map (all changes)
 
@@ -64,6 +67,24 @@ response toward higher categories.
 
 Validation script lives in the session scratchpad (`validate_ordinal.R`);
 re-create from this list if lost.
+
+## Pre-PR review round (2026-07-16, commit 85a8a733)
+
+An 8-angle code review + gauntlet (SEs vs clm/clmm, random slopes, K=2==binomial,
+AIC/df, offsets, NA, saveload, REML, K=9 sparse, separation, psi priors) found and
+fixed: probit/cloglog tail NaN (now branch-free logspace identity on
+logit_inverse_linkfun values); threshold overflow (prefix/suffix logsumexp);
+Anova III singular error (zero-variance hypothesis rows dropped); Anova
+rewriting user vcov. (missing() guard); confint missing thresholds (analytic
+delta-method CIs); integer-code K truncation (warning); simulate type
+round-trip (factor_response attr); E[Y] taped during fitting (whichPredict
+gate); double ADREPORT jacobians (doPredict==4 for probs); PIT duplication
+(pit_norm_resids helper). REFUTED: sparse-X intercept concern. Deferred with
+notes: Pearson residuals return NA + warning (family variance stub convention);
+vcov(full=TRUE) psi rows carry threshold labels but raw-psi values (pre-existing
+convention, same as tweedie); psi priors broken R-side for ALL families
+(pre-existing; C++ psi_vprior exists); REML doesn't integrate psi (flagged in
+PR body for Bolker).
 
 ## Known issues / follow-ups
 

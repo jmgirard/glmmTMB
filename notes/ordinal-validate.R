@@ -93,7 +93,11 @@ fit_sim <- glmmTMB(y ~ x + (1 | g), data = simdat, family = ordinal())
 cat(sprintf("beta: true %.2f est %.3f | RE sd: true %.2f est %.3f\n",
             b_true, fixef(fit_sim)$cond["x"], sd_true,
             attr(VarCorr(fit_sim)$cond$g, "stddev")))
-chk("sim thresholds", unname(family_params(fit_sim)), theta_true, tol = 0.15)
+## compare against clmm on the SAME data (deviation from theta_true is
+## sampling noise; glmmTMB and clmm should agree closely)
+fit_sim_clmm <- ordinal::clmm(y ~ x + (1 | g), data = simdat)
+chk("sim thresholds vs clmm", unname(family_params(fit_sim)),
+    unname(fit_sim_clmm$alpha), tol = 1e-3)
 
 ## simulate() from fitted model returns ordered factor w/ right levels
 ss <- simulate(fit_sim, nsim = 2, seed = 1)
